@@ -49,8 +49,10 @@ def get_argparser():
                         help='官方学习率随训练改变')
     parser.add_argument('--blr', default=1e-3, type=float, metavar='LR',
                         help='base lr,absolute_lr = base_lr * total_batch_size / 256')
-    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
+    parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
+    parser.add_argument('--lr_decay', type=float, default=1e-2,
+                        help='layer-wise lr decay from ELECTRA/BEiT')
     parser.add_argument('--weight_decay', default=0.05, type=float)
     parser.add_argument('--warm_up_epochs', default=10, type=int,
                         help='模型学习率预热，模型从较小学习率开始随着训练迭代次数不断增加，有利于模型稳定和加快收敛速度')
@@ -152,9 +154,21 @@ def main(args):
     optimizer = torch.optim.AdamW(para, lr=args.lr, betas=(0.9, 0.95))
     criterion = nn.CrossEntropyLoss()
 
-    warm_up_with_cosine_lr = lambda epoch: epoch / args.warm_up_epochs if epoch <= args.warm_up_epochs else 0.5 * (
-            math.cos((epoch - args.warm_up_epochs) / (args.epochs - args.warm_up_epochs) * math.pi) + 1)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warm_up_with_cosine_lr)
+    # learning rate scheduler: warmup + consine
+    def lr_lambda(epoch):
+        eta_min = args.lr * (args.lr_decay ** 3)
+        warmup_to = eta_min + (args.lr - eta_min) * (1 + math.cos(math.pi * args.warm_up_epochs / args.epochs)) / 2
+        if epoch < args.warm_up_epochs:
+            p = epoch / args.warm_up_epochs
+            lr = args.min_lr + p * (warmup_to - args.min_lr)
+        else:
+            eta_min = args.lr * (args.lr_decay ** 3)
+            lr = eta_min + (args.lr - eta_min) * (1 + math.cos(math.pi * epoch / args.epochs)) / 2
+        return lr
+
+    # warm_up_with_cosine_lr = lambda epoch: epoch / args.warm_up_epochs if epoch <= args.warm_up_epochs else 0.5 * (
+    #        math.cos((epoch - args.warm_up_epochs) / (args.epochs - args.warm_up_epochs) * math.pi) + 1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # 训练
     start_time = time.time()
@@ -180,7 +194,12 @@ def main(args):
                 print('epoch:%d , lr:%5f, batch:%d, loss:%5f' % (
                     epoch + 1, args.lr, i + 1, sum(train_loss) / len(train_loss)))
 
-    # 每微调一轮测试一次
+    # 保存模型
+    torch.save(model.state_dict(), './mae_base_finetune.pth')
+    # 载入模型
+    model.load_state_dict(torch.load('./mae_base_finetune.pth'))
+
+    # 验证
     model.eval()
     correct = 0
     total = 0
@@ -192,17 +211,12 @@ def main(args):
             predict = torch.max(output, dim=1)[1]
             total += labels.size(0)
             correct += (predict == label).sum()
-        if j % 20 == 0:
-            print("test accuracy：%5f" % (correct / total * 100), "%")
+        print("test accuracy：%5f" % (correct / total * 100), "%")
 
     end_time = time.time()
     total_time = end_time - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
-
-    # 保存模型
-    torch.save(model.state_dict(), './mae_base_finetune.pth')
-
 
 if __name__ == '__main__':
     args = get_argparser()
