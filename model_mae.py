@@ -56,15 +56,15 @@ class Mae(nn.Module):
         self.norm_pix_loss = norm_pix_loss
 
         '''不进行2d初始化结果怎么样？'''
-        # self.initialize_weights()
+        '''没有位置编码和网络参数的初始化，预训练模型微调结果很差'''
+        self.initialize_weights()
 
     # 位置编码的权重初始化
-    # 如果不初始化位置编码的值，就直接使用nn.Parameter()初始化的全0进行学习
     def initialize_weights(self):
         # initialization
         # initialize (and freeze) pos_embed by sin-cos embedding
-        pos_embed = get_2d_sincos_pos_embed()(self.pos_embed.shape[-1], int(self.patch_embed.num_patches ** .5),
-                                              cls_token=True)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1],
+                                            int(self.patch_embed.num_patches ** .5), cls_token=True)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         decoder_pos_embed = get_2d_sincos_pos_embed(self.decoder_pos_embed.shape[-1],

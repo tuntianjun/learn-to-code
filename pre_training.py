@@ -8,7 +8,7 @@ import os
 # 指定运行的GPU
 import time
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 
 import argparse
 import datetime
@@ -23,6 +23,8 @@ import torchvision.datasets as datasets
 import timm.optim.optim_factory as optim_factory
 
 import model_mae
+from utils.lr_sched import adjust_lr
+import numpy as np
 
 
 def get_argparser():
@@ -58,7 +60,7 @@ def get_argparser():
                         help='预训练权重存储位置')
     parser.add_argument('--log_dir', default='/home/wjw/log_dir',
                         help='tensorboard日志存储位置')
-    parser.add_argument('--random_seed', default=0, type=int,
+    parser.add_argument('--seed', default=0, type=int,
                         help='设置随机种子，保证实验结果可复现')
     parser.add_argument('--resume', default='', help='从检查点恢复')
 
@@ -79,6 +81,12 @@ def get_argparser():
 def main(args):
     '''预训练主函数'''
     device = torch.device(args.device)
+
+    # 固定随机种子
+    seed = args.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
     # 自动寻找高效算法(如最适合的卷积实现算法)，提高计算效率
     cudann.benchmark = True
 
@@ -94,11 +102,16 @@ def main(args):
     dataset_train = datasets.ImageFolder(os.path.join(args.dataset_path, 'train'), transform=transformer_train)
     print(dataset_train.class_to_idx)
 
+    # 随机采样
+    train_data_sampler = torch.utils.data.RandomSampler(dataset_train)
+
     data_loader_train = DataLoader(
         dataset_train,
+        sampler=train_data_sampler,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
+        # 丢弃最后不足batch size大小的数据
         drop_last=True
     )
 
@@ -115,28 +128,67 @@ def main(args):
         args.lr = args.blr * args.batch_size / 256
     # 优化器
     para = optim_factory.add_weight_decay(model_optim, args.weight_decay)
-    optimizer = torch.optim.AdamW(para, lr=args.lr, betas=(0.9, 0.95))
+    #optimizer = torch.optim.AdamW(para, lr=args.lr, betas=(0.9, 0.95))
+    optimizer = torch.optim.SGD(para, lr=args.lr)
 
     # 训练
     model.train()
+    print('pretrain for %d epochs' % args.epochs)
+    print('learning rate %5f' % args.lr)
     start_time = time.time()
+
+    optimizer.zero_grad()
     for epoch in range(args.epochs):
-        train_loss = 0.0
+        train_loss = []
+        temp1 = time.time()
+
+        # lr = adjust_lr(optimizer, epoch, args)
+
+        # MAE源码中每个epoch开始前都要先对优化器梯度置0
+        '''对loss是否有影响？'''
+        # optimizer.zero_grad()
+
         for i, (datas, labels) in enumerate(data_loader_train):
+            '''
+            1.adamw 优化器 + warm_up + sincos lr
+            结果：loss 先降再升-循环
+                 可能是陷入局部最优或是学习率太大
+            '''
+            '''
+            2. adamw 优化器 + 固定学习率
+            结果：loss收敛到一定程度就不再下降
+            '''
+            '''
+            3. SGD 优化器 + warm_up + sincos lr 
+            '''
+            '''
+            4. SGD 优化器 + 固定学习率
+            '''
+            lr = adjust_lr(optimizer, i / len(data_loader_train) + epoch, args)
+            # optimizer = torch.optim.AdamW(para, lr=lr, betas=(0.9, 0.95))
+
+            optimizer = torch.optim.SGD(para, lr=lr)
+
             datas = datas.to(device)
-            # labels = labels.to(device)
-            optimizer.zero_grad()
-            # outputs=model(datas)
-            loss, _, _ = model(datas, mask_ratio=args.mask_ratio)
-            # loss = criterion(outputs, labels)
+            # optimizer.zero_grad()
+
+            # 混合精度计算
+            with torch.cuda.amp.autocast():
+                loss, _, _ = model(datas, mask_ratio=args.mask_ratio)
+
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
-            # prediction = torch.max(outputs, dim=1)[1]
+            optimizer.zero_grad()
+
+            train_loss.append(loss.item())
+
             if (i+1) % 20 == 0:
                 print('epoch:%d , lr:%5f,  batch:%d, loss:%5f' % (
-                    epoch + 1, args.lr, i + 1, loss.item() / len(data_loader_train.dataset)))
-        print('epoch:%d and the average loss is:%5f'%(epoch+1,train_loss/len(data_loader_train.dataset)))
+                    epoch + 1, lr, i + 1, sum(train_loss) / len(train_loss)))
+        temp2 = time.time()
+        temp_time = temp2 - temp1
+        temp = str(datetime.timedelta(seconds=int(temp_time)))
+        print('Training 1 epoch time {}'.format(temp))
 
     end_time = time.time()
     total_time = end_time - start_time
@@ -144,7 +196,7 @@ def main(args):
     print('Training time {}'.format(total_time_str))
 
     # 保存模型
-    torch.save(model.state_dict(), './mae_base_pretrain.pth')
+    torch.save(model.state_dict(), './mae_base_pretrain_1.pth')
 
 
 if __name__ == '__main__':
