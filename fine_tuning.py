@@ -29,6 +29,7 @@ import timm.optim.optim_factory as optim_factory
 import model_vit
 from utils.lr_sched import adjust_lr
 from utils.position_embedding import interpolate_pos_embed
+from utils.misc import NativeScalerWithGradNormCount as NativeScaler
 
 
 def get_argparser():
@@ -53,8 +54,8 @@ def get_argparser():
                         help='base lr,absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR',
                         help='lower lr bound for cyclic schedulers that hit 0')
-    # parser.add_argument('--lr_decay', type=float, default=1e-2,
-    #                   help='layer-wise lr decay from ELECTRA/BEiT')
+    parser.add_argument('--layer_decay', type=float, default=0.75,
+                       help='layer-wise lr decay from ELECTRA/BEiT')
     parser.add_argument('--weight_decay', default=0.05, type=float)
     parser.add_argument('--warmup_epochs', default=5, type=int,
                         help='模型学习率预热，模型从较小学习率开始随着训练迭代次数不断增加，有利于模型稳定和加快收敛速度')
@@ -64,7 +65,7 @@ def get_argparser():
                         help='数据集所在位置')
     #parser.add_argument('--checkpoint_path', default='/data/wjw/mae_base_pretrain.pth',
     #                    help='fine_tuning from checkpoint')
-    parser.add_argument('--checkpoint_path', default='/home/wjw/mae_base_pretrain.pth',
+    parser.add_argument('--checkpoint_path', default='/home/wjw/mae_base_pretrain_1.pth',
                         help='fine_tuning from checkpoint')
     parser.add_argument('--output_dir', default='/home/wjw/finetuning_output_dir',
                         help='微调权重存储位置')
@@ -82,17 +83,13 @@ def get_argparser():
     parser.add_argument('--no_pin_memory', action='store_false')
     parser.set_defaults(pin_memory=True)
 
-    # mix_up数据增强
-    # TODO
-    # 多张GPU上分布式训练参数
-    # TODO
-
+    # mix_up数据增强 TODO
 
     return parser
 
 
 def main(args):
-    '''预训练主函数'''
+    '''微调主函数'''
     device = torch.device(args.device)
 
     # 固定随机种子
@@ -158,42 +155,49 @@ def main(args):
 
     # 模型大小
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Model = %s" % str(model_optim))
-    print('number of params (M): %.2f' % (n_parameters / 1.e6))
+    # print("Model = %s" % str(model_optim))
+    print('Number of finetune params (M): %.2f' % (n_parameters / 1.e6))
 
-    # 分布式训练设置,以及分布式使用多张GPU
-    # TODO
+    # 分布式训练设置,以及分布式使用多张GPU TODO
 
     # 学习率设置
     if args.lr is None:
         args.lr = args.blr * args.batch_size / 256
 
-    # finetune 阶段使用 layer-wise learning rate decay
-
-    # finetune 位置编码插值
-    # TODO
+    # finetune 位置编码插值 TODO
     interpolate_pos_embed()
 
     # 优化器
+    # 官方源码使用的是layer_wise lr decay TODO
+    # para = lr_decay.param_group_lrd(model_optim, args.weight_decay,
+    #                                 no_weight_decay_list=model_without_ddp.no_weight_decay(),
+    #                                 layer_decay=args.layer_decay)
     para = optim_factory.add_weight_decay(model_optim, args.weight_decay)
     optimizer = torch.optim.AdamW(para, lr=args.lr, betas=(0.9, 0.95))
     criterion = nn.CrossEntropyLoss()
+    loss_scaler = NativeScaler()
 
     def train(model_train, epoch):
         model_train.train()
         train_loss = []
         for i, (datas, labels) in enumerate(data_loader_train):
+
             lr = adjust_lr(optimizer, i / len(data_loader_train) + epoch, args)
             datas = datas.to(device)
             labels = labels.to(device)
-            optimizer.zero_grad()
+
             with torch.cuda.amp.autocast():
                 outputs = model_train(datas)
                 loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+
+            loss_scaler(loss, optimizer, parameters=model.parameters(),
+                        update_grad=(i + 1) % 1 == 0)
+            optimizer.zero_grad()
+            # loss.backward()
+            # optimizer.step()
+
             train_loss.append(loss.item())
-            # prediction = torch.max(outputs, dim=1)[1]
+
             if (i + 1) % 20 == 0:
                 print('epoch:%d , lr:%5f, batch:%d, loss:%5f' % (
                     epoch + 1, lr, i + 1, sum(train_loss) / len(train_loss)))
@@ -214,17 +218,23 @@ def main(args):
                 val_loss.append(loss.item())
                 total += label.size(0)
                 correct += (predict == label).sum()
-            print('val loss :%5f,' % (sum(val_loss)/len(val_loss)))
-            print("val accuracy：%5f " % (correct / total * 100), "%")
+                print('val loss :%5f,' % (sum(val_loss)/len(val_loss)))
+                print("val accuracy：%5f " % (correct / total * 100), "%")
 
     model.load_state_dict(torch.load(args.checkpoint_path), strict=False)
-    print('load pre_training model from: %s' % args.checkpoint_path)
+    print('Load pre_training model from: %s' % args.checkpoint_path)
+
+    print('Finetune for %d epochs, warmup for %d epochs.' % (args.epochs, args.warmup_epochs))
+    print('Learning rate %5f' % args.lr)
+
     for epoch in range(args.epochs):
+
         start_time = time.time()
         train(model, epoch)
 
         if epoch == args.epochs:
             torch.save(model.state_dict(), '/data/wjw/mae_bae_finetune.pth')
+            print('------Finetune Done!------')
 
         mid_time = time.time()
         temp1 = str(datetime.timedelta(seconds=int(mid_time-start_time)))
@@ -234,58 +244,7 @@ def main(args):
         end_time = time.time()
         temp2 = str(datetime.timedelta(seconds=int(end_time - mid_time)))
         print('Val time for one epoch{}'.format(temp2))
-'''
-    # 训练
-    start_time = time.time()
-    model.load_state_dict(torch.load(args.checkpoint_path))
-    print('load pre_training model from: %s' % args.checkpoint_path)
 
-    model.train()
-    print('start finetune for: %d epochs' % args.epochs)
-    for epoch in range(args.epochs):
-        train_loss = []
-        lr = adjust_lr(optimizer, epoch, args)
-        for i, (datas, labels) in enumerate(data_loader_train):
-            datas = datas.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
-                outputs = model(datas)
-                loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            train_loss.append(loss.item())
-            # prediction = torch.max(outputs, dim=1)[1]
-            if (i + 1) % 20 == 0:
-                print('epoch:%d , lr:%5f, batch:%d, loss:%5f' % (
-                    epoch + 1, lr, i + 1, sum(train_loss) / len(train_loss)))
-
-    # 保存模型
-    torch.save(model.state_dict(), './mae_base_finetune.pth')
-    # 载入模型
-    model.load_state_dict(torch.load('./mae_base_finetune.pth'))
-
-    # 验证
-    model.eval()
-    correct = 0
-    total = 0
-    # val_loss = []
-    with torch.no_grad():
-        for j, (data, label) in enumerate(data_loader_val):
-            data = data.to(device)
-            label = label.to(device)
-            with torch.cuda.amp.autocast():
-                output = model(data)
-            predict = torch.max(output, dim=1)[1]
-            total += label.size(0)
-            correct += (predict == label).sum()
-        print("test accuracy：%5f" % (correct / total * 100), "%")
-
-    end_time = time.time()
-    total_time = end_time - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
-'''
 if __name__ == '__main__':
     args = get_argparser()
     args = args.parse_args()

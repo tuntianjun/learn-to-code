@@ -5,17 +5,18 @@
 # @Software: PyCharm
 
 import os
-# 指定运行的GPU
+
 import time
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+# 指定运行的GPU
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 import argparse
 import datetime
 from pathlib import Path
 
 import torch
-import torch.backends.cudnn as cudann
+import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
@@ -26,6 +27,10 @@ import model_mae
 from utils.lr_sched import adjust_lr
 import numpy as np
 
+from utils.misc import NativeScalerWithGradNormCount as NativeScaler
+from torch.cuda.amp import GradScaler
+
+torch.cuda.empty_cache()
 
 def get_argparser():
     '''预训练超参数设置'''
@@ -72,8 +77,7 @@ def get_argparser():
     parser.add_argument('--no_pin_memory', action='store_false')
     parser.set_defaults(pin_memory=True)
 
-    # 多张GPU上分布式训练参数
-    # TODO
+    # 多张GPU上分布式训练参数 TODO
 
     return parser
 
@@ -88,7 +92,7 @@ def main(args):
     np.random.seed(seed)
 
     # 自动寻找高效算法(如最适合的卷积实现算法)，提高计算效率
-    cudann.benchmark = True
+    cudnn.benchmark = True
 
     # 数据增强
     transformer_train = transforms.Compose([
@@ -100,7 +104,7 @@ def main(args):
 
     # 自定义数据集
     dataset_train = datasets.ImageFolder(os.path.join(args.dataset_path, 'train'), transform=transformer_train)
-    print(dataset_train.class_to_idx)
+    # print(dataset_train.class_to_idx)
 
     # 随机采样
     train_data_sampler = torch.utils.data.RandomSampler(dataset_train)
@@ -120,71 +124,75 @@ def main(args):
     model_optim = model
     model.to(device)
 
-    # 分布式训练设置,以及分布式使用多张GPU
-    # TODO
+    # 模型大小
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # print("Model = %s" % str(model_optim))
+    print('Number of MAE pretrain params (M): %.2f' % (n_parameters / 1.e6))
+
+    # 分布式训练设置,以及分布式使用多张GPU TODO
 
     # 学习率设置
     if args.lr is None:
         args.lr = args.blr * args.batch_size / 256
     # 优化器
     para = optim_factory.add_weight_decay(model_optim, args.weight_decay)
-    #optimizer = torch.optim.AdamW(para, lr=args.lr, betas=(0.9, 0.95))
-    optimizer = torch.optim.SGD(para, lr=args.lr)
+    optimizer = torch.optim.AdamW(para, lr=args.lr, betas=(0.9, 0.95))
+    # print(optimizer)
+
+    # loss_scaler = GradScaler()
+    loss_scaler = NativeScaler()
 
     # 训练
     model.train()
-    print('pretrain for %d epochs' % args.epochs)
-    print('learning rate %5f' % args.lr)
+    print('Pretrain for %d epochs, warmup for %d epochs.' % (args.epochs, args.warmup_epochs))
+    print('Learning rate %5f' % args.lr)
     start_time = time.time()
 
-    optimizer.zero_grad()
     for epoch in range(args.epochs):
         train_loss = []
         temp1 = time.time()
 
-        # lr = adjust_lr(optimizer, epoch, args)
-
-        # MAE源码中每个epoch开始前都要先对优化器梯度置0
-        '''对loss是否有影响？'''
-        # optimizer.zero_grad()
+        optimizer.zero_grad()
 
         for i, (datas, labels) in enumerate(data_loader_train):
             '''
-            1.adamw 优化器 + warm_up + sincos lr
-            结果：loss 先降再升-循环
-                 可能是陷入局部最优或是学习率太大
+            adamw 优化器 + warm_up + sincos lr
+            结果：loss 先降再升-循环 --> 最终原因：autocast()要和GradScaler()一起使用计算混合精度
+                 似乎是混合精度的问题：
+                 (1)加上loss_scaler = GradScaler()后可以正常下降，但下降幅度和速度远不如官方源码,60轮到0.07收敛
+                 (2)去掉源码的train one epoch 2-->0.3-->0.22-->0.18
+                 (3)使用源码的NativeScaler(),unscale gradient loss的变化一致
+                 (4)会不会是loss表示方式有区别？看训练出来的模型微调后的结果？
+                 (5)注释掉源码中关于分布式的内容对于loss的计算没有任何影响
             '''
-            '''
-            2. adamw 优化器 + 固定学习率
-            结果：loss收敛到一定程度就不再下降
-            '''
-            '''
-            3. SGD 优化器 + warm_up + sincos lr 
-            '''
-            '''
-            4. SGD 优化器 + 固定学习率
-            '''
+
             lr = adjust_lr(optimizer, i / len(data_loader_train) + epoch, args)
-            # optimizer = torch.optim.AdamW(para, lr=lr, betas=(0.9, 0.95))
-
-            optimizer = torch.optim.SGD(para, lr=lr)
-
             datas = datas.to(device)
-            # optimizer.zero_grad()
 
             # 混合精度计算
+            # 具体使用在template/pytorch混合精度计算.py
             with torch.cuda.amp.autocast():
                 loss, _, _ = model(datas, mask_ratio=args.mask_ratio)
 
-            loss.backward()
-            optimizer.step()
+            loss_scaler(loss, optimizer, parameters=model.parameters(),
+                        update_grad=(i + 1) % 1 == 0)
             optimizer.zero_grad()
+
+            # 梯度放大
+            # loss_scaler.scale(loss).backward()
+            # scaler.step() 首先把梯度的值unscale回来.
+            # 如果梯度的值不是 infs 或者 NaNs, 那么调用optimizer.step()来更新权重,
+            # 否则，忽略step调用，从而保证权重不更新（不被破坏）
+            # loss_scaler.step(optimizer)
+            # 看是否要增大scaler
+            # loss_scaler.update()
 
             train_loss.append(loss.item())
 
             if (i+1) % 20 == 0:
                 print('epoch:%d , lr:%5f,  batch:%d, loss:%5f' % (
                     epoch + 1, lr, i + 1, sum(train_loss) / len(train_loss)))
+
         temp2 = time.time()
         temp_time = temp2 - temp1
         temp = str(datetime.timedelta(seconds=int(temp_time)))
@@ -193,10 +201,11 @@ def main(args):
     end_time = time.time()
     total_time = end_time - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('------Pretrain Done!------')
     print('Training time {}'.format(total_time_str))
 
     # 保存模型
-    torch.save(model.state_dict(), './mae_base_pretrain_1.pth')
+    torch.save(model.state_dict(), './mae_base_pretrain.pth')
 
 
 if __name__ == '__main__':
